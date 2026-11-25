@@ -1,0 +1,183 @@
+Ниже реализация безопасного режима. Вся логика находится в `MainWindow` (это представление) и в `MavlinkManager` (корректная генерация событий связи). Команды, которые блокируются: «Взлёт», «Посадка», «Стоп».
+
+## 1. MavlinkManager: корректные события связи
+
+В исходном коде `onReadyRead()` не выставляет `m_linkConnected = true` и не обновляет `m_lastPacketTime`. Без этого `checkLinkTimeout()` никогда не сработает, а восстановление связи не обнаружится. Исправьте:
+
+```cpp
+// mavlinkmanager.h — добавьте в private:
+bool      m_linkConnected = false;
+QDateTime m_lastPacketTime;
+QString   m_lastAddress;
+quint16   m_lastPort = 0;
+QTimer   *m_linkTimer = nullptr;
+
+private slots:
+    void checkLinkTimeout();
+```
+
+```cpp
+// mavlinkmanager.cpp
+void MavlinkManager::onReadyRead()
+{
+    while (m_udpSocket->hasPendingDatagrams()) {
+        QNetworkDatagram datagram = m_udpSocket->receiveDatagram();
+        if (!datagram.isValid())
+            continue;
+
+        m_receivedPackets++;
+        m_lastAddress = datagram.senderAddress().toString();
+        m_lastPort    = datagram.senderPort();
+        m_lastPacketTime = QDateTime::currentDateTime();
+
+        // Сигнал только при ИЗМЕНЕНИИ состояния, а не на каждый пакет
+        if (!m_linkConnected) {
+            m_linkConnected = true;
+            emit linkStateChanged(true, m_lastAddress, m_lastPort);
+        }
+
+        emit packetReceived(m_receivedPackets, m_lostPackets);
+        processDatagram(datagram.data());
+    }
+}
+
+// в start() после успешного bind():
+m_linkTimer = new QTimer(this);
+m_linkTimer->setInterval(1000);
+connect(m_linkTimer, &QTimer::timeout,
+        this, &MavlinkManager::checkLinkTimeout);
+m_linkTimer->start();
+```
+
+`checkLinkTimeout()` оставьте как в задании: он эмитит `linkStateChanged(false, ...)` один раз, после чего `m_linkConnected == false`.
+
+## 2. MainWindow: заголовок
+
+```cpp
+// mainwindow.h
+private:
+    void setCommandsEnabled(bool enabled);
+    void addLogRecord(const QString &type, const QString &text);
+
+    bool m_linkUp        = false;   // предыдущее состояние связи
+    bool m_everConnected = false;   // была ли хоть раз связь
+    QDateTime m_lastLinkTime;
+```
+
+## 3. MainWindow: реализация
+
+```cpp
+#include <QTime>
+#include <QStatusBar>
+
+void MainWindow::setCommandsEnabled(bool enabled)
+{
+    ui->btnTakeoff->setEnabled(enabled);
+    ui->btnLand->setEnabled(enabled);
+    ui->btnStop->setEnabled(enabled);
+    ui->spinTakeoffAltitude->setEnabled(enabled);
+
+    const QString tip = enabled
+        ? QString()
+        : QString("Недоступно: нет связи с БПЛА");
+    ui->btnTakeoff->setToolTip(tip);
+    ui->btnLand->setToolTip(tip);
+    ui->btnStop->setToolTip(tip);
+}
+
+void MainWindow::addLogRecord(const QString &type, const QString &text)
+{
+    ui->listCommandLog->insertItem(0,
+        QString("[%1] %2: %3")
+            .arg(QTime::currentTime().toString("hh:mm:ss"))
+            .arg(type)
+            .arg(text));
+}
+
+void MainWindow::onLinkStateChanged(bool connected,
+                                    const QString &address,
+                                    quint16 port)
+{
+    if (connected == m_linkUp)      // защита от повторных одинаковых сигналов
+        return;
+    m_linkUp = connected;
+
+    if (connected) {
+        ui->labelLinkStatus->setText("Связь установлена");
+        ui->labelLinkStatus->setStyleSheet("color: green; font-weight: bold;");
+        ui->labelSender->setText(address + ":" + QString::number(port));
+
+        setCommandsEnabled(true);                         // разблокировка
+
+        if (m_everConnected) {                            // это именно ВОССТАНОВЛЕНИЕ
+            statusBar()->showMessage("Связь восстановлена", 5000);
+            addLogRecord("LINK", "Связь восстановлена");
+        } else {
+            addLogRecord("LINK", "Первое подключение: "
+                         + address + ":" + QString::number(port));
+        }
+        m_everConnected = true;
+    } else {
+        ui->labelLinkStatus->setText("Связь потеряна");
+        ui->labelLinkStatus->setStyleSheet(
+            "color: red; font-weight: bold; background: #ffdddd;");
+        ui->labelSender->setText("—");
+
+        setCommandsEnabled(false);                        // блокировка
+
+        addLogRecord("LINK", "Связь потеряна, команды заблокированы");
+    }
+}
+```
+
+Состояние при запуске: в конструкторе `MainWindow` (после `setupUi`) вызовите `setCommandsEnabled(false);`. До первого пакета связи нет, поэтому кнопки должны быть заблокированы.
+
+## 4. Ограничение onMavlinkError
+
+Сообщение «Связь с БПЛА потеряна» приходит и через `errorOccurred`. Чтобы оно не перезаписало статус и не дублировалось в журнале, не пишите его туда повторно:
+
+```cpp
+void MainWindow::onMavlinkError(const QString &message)
+{
+    addLogRecord("ERROR", message);
+    if (m_linkUp) {          // если связь есть, это ошибка пакета, а не потери связи
+        ui->labelLinkStatus->setText("Ошибка: " + message);
+        ui->labelLinkStatus->setStyleSheet("color: orange; font-weight: bold;");
+    }
+}
+```
+
+Если хотите избежать дубля «Связь потеряна» в журнале, уберите `emit errorOccurred("Связь с БПЛА потеряна")` из `checkLinkTimeout()`. События связи уже обрабатываются через `linkStateChanged`.
+
+## 5. Защита на уровне слотов (второй рубеж)
+
+Заблокированная кнопка не гарантирует, что команду нельзя вызвать иначе, например через горячую клавишу. Поэтому проверка остаётся и в обработчиках:
+
+```cpp
+void MainWindow::on_btnTakeoff_clicked()
+{
+    if (!m_telemetryModel->isLinkConnected()) {
+        QMessageBox::warning(this, "Команда недоступна",
+            "Невозможно отправить команду взлёта: нет связи с БПЛА.");
+        return;
+    }
+    m_mavlinkManager->sendTakeoff(ui->spinTakeoffAltitude->value());
+}
+```
+
+Аналогично для `on_btnLand_clicked()` и `on_btnStop_clicked()`.
+
+## 6. Что добавить в UI
+
+В `mainwindow.ui` нужна кнопка `btnStop` (по заданию это «Стоп»), если её ещё нет. Кнопка `btnDisconnectUav` блокироваться не должна: она относится к эмулятору, а не к командному контуру.
+
+## Проверка по сценарию
+
+| Действие | Ожидаемо |
+|---|---|
+| Запуск НСУ | статус «Связь отсутствует», 3 кнопки серые |
+| Старт эмулятора | зелёный статус, кнопки активны, запись «Первое подключение» |
+| «Отключить БПЛА», через 3 с | красный статус, кнопки серые, запись в журнале |
+| Повторный старт эмулятора | зелёный статус, кнопки активны, «Связь восстановлена» в статус-баре и журнале |
+
+Требования к архитектуре при этом выполнены. В `MavlinkManager` нет обращений к `ui->`, а `MainWindow` реагирует только на сигнал `linkStateChanged`. Если нужен модальный диалог «Связь восстановлена» вместо сообщения в статус-баре, замените `statusBar()->showMessage(...)` на `QMessageBox::information(...)`, но для частых потерь связи это неудобно.
